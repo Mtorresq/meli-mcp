@@ -115,6 +115,11 @@ const TOOLS = [
     name: "ver_visitas",
     description: "Visitas por publicación: cuáles tienen más tráfico, total de visitas y ranking",
     inputSchema: { type: "object", properties: {} }
+  },
+  {
+    name: "ver_conversion",
+    description: "Tasa de conversión por publicación: visitas vs ventas, cuáles convierten bien y cuáles no",
+    inputSchema: { type: "object", properties: {} }
   }
 ];
 
@@ -256,6 +261,92 @@ async function executeTool(name, args) {
       txt += `${i + 1}. ${(v.titulo || "—").slice(0, 45)}\n`;
       txt += `   ${barra} ${v.visitas.toLocaleString("es-AR")} visitas (${pct}%)\n\n`;
     });
+
+    return txt;
+  }
+
+  if (name === "ver_conversion") {
+    // Obtener publicaciones con ventas
+    const search = await meliGet(`/users/${CONFIG.USER_ID}/items/search?limit=50`);
+    const ids = (search.results || []).slice(0, 20);
+    if (!ids.length) return "No hay publicaciones.";
+
+    // Obtener detalles (precio, stock, vendidas)
+    const itemsRes = await meliGet(`/items?ids=${ids.join(",")}`);
+    const items = {};
+    (itemsRes || []).forEach(r => {
+      if (r.body) items[r.body.id] = {
+        titulo: r.body.title,
+        vendidas: r.body.sold_quantity || 0,
+        precio: r.body.price || 0,
+        estado: r.body.status,
+      };
+    });
+
+    // Obtener visitas de cada publicación
+    const resultados = await Promise.all(
+      ids.map(async (id) => {
+        try {
+          const v = await meliGet(`/items/${id}/visits?last=30`);
+          const visitas = v.total_visits || Object.values(v.results || {}).reduce((a, b) => a + b, 0);
+          const item = items[id] || {};
+          const tasa = visitas > 0 ? ((item.vendidas || 0) / visitas * 100) : 0;
+          return {
+            id,
+            titulo: item.titulo || id,
+            visitas,
+            vendidas: item.vendidas || 0,
+            tasa,
+            precio: item.precio || 0,
+            estado: item.estado,
+          };
+        } catch (e) {
+          return { id, titulo: items[id]?.titulo || id, visitas: 0, vendidas: items[id]?.vendidas || 0, tasa: 0, precio: items[id]?.precio || 0 };
+        }
+      })
+    );
+
+    // Ordenar por tasa de conversión
+    resultados.sort((a, b) => b.tasa - a.tasa);
+
+    const totalVisitas = resultados.reduce((s, r) => s + r.visitas, 0);
+    const totalVentas = resultados.reduce((s, r) => s + r.vendidas, 0);
+    const tasaGlobal = totalVisitas > 0 ? (totalVentas / totalVisitas * 100).toFixed(1) : 0;
+
+    let txt = `📈 CONVERSIÓN — ÚLTIMOS 30 DÍAS\n${"═".repeat(30)}\n\n`;
+    txt += `👁️ Visitas totales: ${totalVisitas.toLocaleString("es-AR")}\n`;
+    txt += `💰 Ventas totales: ${totalVentas}\n`;
+    txt += `📊 Tasa global: ${tasaGlobal}%\n\n`;
+
+    // Mejores conversiones
+    const buenos = resultados.filter(r => r.visitas > 0 && r.tasa > 0);
+    const sinConversion = resultados.filter(r => r.visitas > 0 && r.tasa === 0);
+    const sinVisitas = resultados.filter(r => r.visitas === 0);
+
+    if (buenos.length) {
+      txt += `✅ CONVIERTEN BIEN:\n`;
+      buenos.forEach(r => {
+        txt += `  • ${r.titulo.slice(0, 42)}\n`;
+        txt += `    👁️ ${r.visitas} visitas → 💰 ${r.vendidas} ventas (${r.tasa.toFixed(1)}%)\n`;
+      });
+      txt += "\n";
+    }
+
+    if (sinConversion.length) {
+      txt += `⚠️ TIENEN VISITAS PERO NO VENDEN:\n`;
+      sinConversion.forEach(r => {
+        txt += `  • ${r.titulo.slice(0, 42)}\n`;
+        txt += `    👁️ ${r.visitas} visitas → 0 ventas — revisar precio/fotos/descripción\n`;
+      });
+      txt += "\n";
+    }
+
+    if (sinVisitas.length) {
+      txt += `❌ SIN VISITAS (últimos 30 días):\n`;
+      sinVisitas.forEach(r => {
+        txt += `  • ${r.titulo.slice(0, 42)}\n`;
+      });
+    }
 
     return txt;
   }
