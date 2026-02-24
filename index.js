@@ -73,7 +73,6 @@ async function meliGet(path) {
   return data;
 }
 
-// Auto-renovar cada 5 horas
 setInterval(async () => {
   if (CONFIG.REFRESH_TOKEN) {
     try { await refreshToken(); }
@@ -110,6 +109,11 @@ const TOOLS = [
   {
     name: "ver_reputacion",
     description: "Reputación como vendedor y métricas de calidad",
+    inputSchema: { type: "object", properties: {} }
+  },
+  {
+    name: "ver_visitas",
+    description: "Visitas por publicación: cuáles tienen más tráfico, total de visitas y ranking",
     inputSchema: { type: "object", properties: {} }
   }
 ];
@@ -211,10 +215,54 @@ async function executeTool(name, args) {
     return `⭐ REPUTACIÓN NOOR KIDS\n\nNivel: ${rep?.level_id||"—"}\nVentas completadas: ${rep?.transactions?.completed||0}\nCanceladas: ${rep?.transactions?.canceled||0}\n\n📊 Métricas (365 días):\n  Ventas: ${m?.sales?.completed||0}\n  Reclamos: ${m?.claims?.value||0} (${((m?.claims?.rate||0)*100).toFixed(1)}%)\n  Cancelaciones: ${m?.cancellations?.value||0}`;
   }
 
+  if (name === "ver_visitas") {
+    // Obtener IDs de publicaciones
+    const search = await meliGet(`/users/${CONFIG.USER_ID}/items/search?limit=50`);
+    const ids = (search.results || []).slice(0, 20);
+    if (!ids.length) return "No hay publicaciones.";
+
+    // Obtener títulos
+    const itemsRes = await meliGet(`/items?ids=${ids.join(",")}`);
+    const titulos = {};
+    (itemsRes || []).forEach(r => {
+      if (r.body) titulos[r.body.id] = r.body.title;
+    });
+
+    // Obtener visitas de cada publicación en paralelo
+    const visitas = await Promise.all(
+      ids.map(async (id) => {
+        try {
+          const v = await meliGet(`/items/${id}/visits?last=30`);
+          const total = v.total_visits || Object.values(v.results || {}).reduce((a, b) => a + b, 0);
+          return { id, titulo: titulos[id] || id, visitas: total };
+        } catch (e) {
+          return { id, titulo: titulos[id] || id, visitas: 0 };
+        }
+      })
+    );
+
+    // Ordenar por visitas descendente
+    visitas.sort((a, b) => b.visitas - a.visitas);
+    const totalVisitas = visitas.reduce((s, v) => s + v.visitas, 0);
+
+    let txt = `👁️ VISITAS — ÚLTIMOS 30 DÍAS\n${"═".repeat(30)}\n\n`;
+    txt += `📊 Total visitas: ${totalVisitas.toLocaleString("es-AR")}\n`;
+    txt += `📦 Publicaciones analizadas: ${ids.length}\n\n`;
+    txt += `🏆 RANKING POR VISITAS:\n\n`;
+
+    visitas.forEach((v, i) => {
+      const barra = "█".repeat(Math.min(Math.round(v.visitas / Math.max(visitas[0].visitas, 1) * 10), 10));
+      const pct = totalVisitas > 0 ? Math.round(v.visitas / totalVisitas * 100) : 0;
+      txt += `${i + 1}. ${(v.titulo || "—").slice(0, 45)}\n`;
+      txt += `   ${barra} ${v.visitas.toLocaleString("es-AR")} visitas (${pct}%)\n\n`;
+    });
+
+    return txt;
+  }
+
   return `Herramienta desconocida: ${name}`;
 }
 
-// ── EXPRESS ──
 const app = express();
 app.use(express.json());
 
