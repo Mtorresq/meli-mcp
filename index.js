@@ -1,5 +1,8 @@
 import express from "express";
 import https from "https";
+import pg from "pg";
+
+const { Pool } = pg;
 
 const CONFIG = {
   CLIENT_ID:     process.env.MELI_CLIENT_ID     || "919130041209199",
@@ -11,7 +14,48 @@ const CONFIG = {
 };
 
 const RESEND_KEY = process.env.RESEND_API_KEY || "re_QnPyNvCN_AREJWxEMFmmM3ey9b3DMbLui";
-const EMAIL_TO   = process.env.EMAIL_TO        || "noorkidsar@gmail.com";
+const EMAIL_TO   = process.env.EMAIL_TO        || "miguel.torres@gmail.com";
+const DATABASE_URL = process.env.DATABASE_URL;
+
+// ── BASE DE DATOS ──
+let pool;
+async function initDB() {
+  if (!DATABASE_URL) { console.log("Sin DATABASE_URL, usando solo memoria"); return; }
+  pool = new Pool({ connectionString: DATABASE_URL, ssl: { rejectUnauthorized: false } });
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS tokens (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TIMESTAMP DEFAULT NOW()
+    )
+  `);
+  console.log("✅ Base de datos conectada");
+
+  // Cargar tokens guardados
+  const res = await pool.query("SELECT key, value FROM tokens WHERE key IN ('access_token','refresh_token')");
+  res.rows.forEach(row => {
+    if (row.key === "access_token")  CONFIG.ACCESS_TOKEN  = row.value;
+    if (row.key === "refresh_token") CONFIG.REFRESH_TOKEN = row.value;
+  });
+  if (CONFIG.ACCESS_TOKEN) console.log("✅ Tokens cargados desde la base de datos");
+}
+
+async function saveTokens(accessToken, refreshToken) {
+  CONFIG.ACCESS_TOKEN  = accessToken;
+  if (refreshToken) CONFIG.REFRESH_TOKEN = refreshToken;
+  if (!pool) return;
+  await pool.query(`
+    INSERT INTO tokens (key, value, updated_at) VALUES ('access_token', $1, NOW())
+    ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()
+  `, [accessToken]);
+  if (refreshToken) {
+    await pool.query(`
+      INSERT INTO tokens (key, value, updated_at) VALUES ('refresh_token', $1, NOW())
+      ON CONFLICT (key) DO UPDATE SET value = $1, updated_at = NOW()
+    `, [refreshToken]);
+  }
+  console.log("Tokens guardados en DB:", new Date().toLocaleString());
+}
 
 // ── API HELPERS ──
 function apiRequest(path, token) {
@@ -45,6 +89,7 @@ function postMeli(body) {
 }
 
 async function refreshToken() {
+  if (!CONFIG.REFRESH_TOKEN) throw new Error("No hay refresh token");
   const data = await postMeli({
     grant_type: "refresh_token",
     client_id: CONFIG.CLIENT_ID,
@@ -52,8 +97,7 @@ async function refreshToken() {
     refresh_token: CONFIG.REFRESH_TOKEN,
   });
   if (data.access_token) {
-    CONFIG.ACCESS_TOKEN = data.access_token;
-    if (data.refresh_token) CONFIG.REFRESH_TOKEN = data.refresh_token;
+    await saveTokens(data.access_token, data.refresh_token);
     console.log("Token renovado:", new Date().toLocaleString());
   } else throw new Error("No se pudo renovar: " + JSON.stringify(data));
 }
@@ -61,7 +105,10 @@ async function refreshToken() {
 async function meliGet(path) {
   if (!CONFIG.ACCESS_TOKEN) throw new Error("Sin token. Usá conectar_cuenta primero.");
   const data = await apiRequest(path, CONFIG.ACCESS_TOKEN);
-  if (data.error === "unauthorized") { await refreshToken(); return apiRequest(path, CONFIG.ACCESS_TOKEN); }
+  if (data.error === "unauthorized") {
+    await refreshToken();
+    return apiRequest(path, CONFIG.ACCESS_TOKEN);
+  }
   return data;
 }
 
@@ -75,17 +122,11 @@ function sendEmail(subject, html) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({
       from: "Noor Kids Dashboard <onboarding@resend.dev>",
-      to: [EMAIL_TO],
-      subject,
-      html,
+      to: [EMAIL_TO], subject, html,
     });
     const req = https.request({
       hostname: "api.resend.com", path: "/emails", method: "POST",
-      headers: {
-        "Authorization": `Bearer ${RESEND_KEY}`,
-        "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(body),
-      },
+      headers: { "Authorization": `Bearer ${RESEND_KEY}`, "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) },
     }, (res) => {
       let data = "";
       res.on("data", (c) => (data += c));
@@ -150,10 +191,10 @@ async function enviarResumenSemanal() {
   </div>`;
 
   await sendEmail("📊 Resumen Semanal — Noor Kids", html);
-  console.log("Resumen semanal enviado a", EMAIL_TO);
+  console.log("Resumen enviado a", EMAIL_TO);
 }
 
-// ── CRON: todos los lunes a las 8am Argentina (11:00 UTC) ──
+// Cron: lunes 8am Argentina (11:00 UTC)
 function startCron() {
   const ahora = new Date();
   const diasHastaLunes = ((1 - ahora.getUTCDay()) + 7) % 7 || 7;
@@ -184,7 +225,10 @@ const TOOLS = [
 async function executeTool(name, args) {
   if (name === "conectar_cuenta") {
     const data = await postMeli({ grant_type: "authorization_code", client_id: CONFIG.CLIENT_ID, client_secret: CONFIG.CLIENT_SECRET, code: args.codigo, redirect_uri: CONFIG.REDIRECT_URI });
-    if (data.access_token) { CONFIG.ACCESS_TOKEN = data.access_token; CONFIG.REFRESH_TOKEN = data.refresh_token || ""; return "✅ ¡Cuenta conectada! Token se renueva automáticamente cada 5 horas."; }
+    if (data.access_token) {
+      await saveTokens(data.access_token, data.refresh_token);
+      return "✅ ¡Cuenta conectada! Token guardado en base de datos y se renueva automáticamente.";
+    }
     return `❌ Error: ${data.message || JSON.stringify(data)}`;
   }
 
@@ -264,7 +308,7 @@ async function executeTool(name, args) {
     if (!ids.length) return "No hay publicaciones.";
     const itemsRes = await meliGet(`/items?ids=${ids.join(",")}`);
     const items = {};
-    (itemsRes || []).forEach(r => { if (r.body) items[r.body.id] = { titulo: r.body.title, vendidas: r.body.sold_quantity || 0, precio: r.body.price || 0, estado: r.body.status }; });
+    (itemsRes || []).forEach(r => { if (r.body) items[r.body.id] = { titulo: r.body.title, vendidas: r.body.sold_quantity || 0 }; });
     const resultados = await Promise.all(ids.map(async (id) => {
       try { const v = await meliGet(`/items/${id}/visits?last=30`); const visitas = v.total_visits || Object.values(v.results || {}).reduce((a, b) => a + b, 0); const item = items[id] || {}; return { id, titulo: item.titulo || id, visitas, vendidas: item.vendidas || 0, tasa: visitas > 0 ? (item.vendidas || 0) / visitas * 100 : 0 }; }
       catch (e) { return { id, titulo: items[id]?.titulo || id, visitas: 0, vendidas: items[id]?.vendidas || 0, tasa: 0 }; }
@@ -295,7 +339,7 @@ async function executeTool(name, args) {
 const app = express();
 app.use(express.json());
 
-app.get("/", (req, res) => res.json({ status: "ok", server: "meli-mcp-noor-kids", connected: !!CONFIG.ACCESS_TOKEN }));
+app.get("/", (req, res) => res.json({ status: "ok", server: "meli-mcp-noor-kids", connected: !!CONFIG.ACCESS_TOKEN, db: !!pool }));
 
 app.get("/enviar-resumen", async (req, res) => {
   try { await enviarResumenSemanal(); res.json({ ok: true, mensaje: `Resumen enviado a ${EMAIL_TO}` }); }
@@ -314,8 +358,18 @@ app.post("/mcp", async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Meli MCP Server en puerto ${PORT}`);
-  console.log(`Token activo: ${!!CONFIG.ACCESS_TOKEN}`);
-  startCron();
+
+// Iniciar todo
+initDB().then(() => {
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`🚀 Meli MCP Server en puerto ${PORT}`);
+    console.log(`Token activo: ${!!CONFIG.ACCESS_TOKEN}`);
+    startCron();
+  });
+}).catch(e => {
+  console.error("Error iniciando DB:", e.message);
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`🚀 Meli MCP Server en puerto ${PORT} (sin DB)`);
+    startCron();
+  });
 });
