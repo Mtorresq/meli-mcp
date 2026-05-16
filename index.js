@@ -58,11 +58,11 @@ async function saveTokens(accessToken, refreshToken) {
 }
 
 // ── API HELPERS ──
-function apiRequest(path, token) {
+function apiRequest(path, token, extraHeaders = {}) {
   return new Promise((resolve, reject) => {
     https.get({
       hostname: "api.mercadolibre.com", path,
-      headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
+      headers: { Authorization: `Bearer ${token}`, Accept: "application/json", ...extraHeaders },
     }, (res) => {
       let data = "";
       res.on("data", (c) => (data += c));
@@ -102,12 +102,12 @@ async function refreshToken() {
   } else throw new Error("No se pudo renovar: " + JSON.stringify(data));
 }
 
-async function meliGet(path) {
+async function meliGet(path, extraHeaders = {}) {
   if (!CONFIG.ACCESS_TOKEN) throw new Error("Sin token. Usá conectar_cuenta primero.");
-  const data = await apiRequest(path, CONFIG.ACCESS_TOKEN);
+  const data = await apiRequest(path, CONFIG.ACCESS_TOKEN, extraHeaders);
   if (data.error === "unauthorized") {
     await refreshToken();
-    return apiRequest(path, CONFIG.ACCESS_TOKEN);
+    return apiRequest(path, CONFIG.ACCESS_TOKEN, extraHeaders);
   }
   return data;
 }
@@ -116,6 +116,141 @@ async function meliGet(path) {
 setInterval(async () => {
   if (CONFIG.REFRESH_TOKEN) try { await refreshToken(); } catch (e) { console.error("Error renovando:", e.message); }
 }, 5 * 60 * 60 * 1000);
+
+// ── SEO AUDIT HELPERS ──
+
+// Cache de atributos por categoría (en memoria, válido por sesión)
+const _catAttrCache = {};
+
+// Limita concurrencia para respetar rate limits de MeLi (~10 req/s)
+function createLimiter(maxConcurrent) {
+  let running = 0;
+  const queue = [];
+  return function limit(fn) {
+    return new Promise((resolve, reject) => {
+      const run = async () => {
+        running++;
+        try { resolve(await fn()); }
+        catch (e) { reject(e); }
+        finally {
+          running--;
+          if (queue.length) queue.shift()();
+        }
+      };
+      if (running < maxConcurrent) run();
+      else queue.push(run);
+    });
+  };
+}
+
+// Obtiene todos los IDs de publicaciones del seller con paginación
+async function getAllItemIds(status = "active") {
+  const ids = [];
+  let offset = 0;
+  while (true) {
+    const data = await meliGet(`/users/${CONFIG.USER_ID}/items/search?status=${status}&limit=100&offset=${offset}`);
+    const batch = data.results || [];
+    ids.push(...batch);
+    const total = data.paging?.total ?? 0;
+    if (ids.length >= total || batch.length < 100) break;
+    offset += 100;
+  }
+  console.log(`getAllItemIds: ${ids.length} IDs obtenidos`);
+  return ids;
+}
+
+// Multi-get de items en batches de 20 (reduce requests 20:1)
+async function getItemsMultiBatch(ids) {
+  const fields = "id,title,health,attributes,pictures,tags,domain_id,category_id,sold_quantity,available_quantity,listing_type_id,status,shipping,catalog_listing,catalog_product_id,price";
+  const items = [];
+  for (let i = 0; i < ids.length; i += 20) {
+    const batch = ids.slice(i, i + 20);
+    try {
+      const res = await meliGet(`/items?ids=${batch.join(",")}&attributes=${fields}`);
+      (res || []).forEach(r => { if (r.body && !r.body.error) items.push(r.body); });
+    } catch (e) {
+      console.error(`Error multi-get batch [${i}-${i + 20}]:`, e.message);
+    }
+  }
+  return items;
+}
+
+// Atributos de categoría con cache en memoria
+async function getCatAttributes(categoryId) {
+  if (!categoryId) return [];
+  if (_catAttrCache[categoryId]) return _catAttrCache[categoryId];
+  try {
+    const attrs = await meliGet(`/categories/${categoryId}/attributes`);
+    _catAttrCache[categoryId] = Array.isArray(attrs) ? attrs : [];
+  } catch (e) {
+    console.error(`Error obteniendo atributos de categoría ${categoryId}:`, e.message);
+    _catAttrCache[categoryId] = [];
+  }
+  return _catAttrCache[categoryId];
+}
+
+// Visitas por item usando el endpoint batch; fallback a individual si falla
+async function getVisitsBatch(ids, days = 30) {
+  const results = {};
+  const limit = createLimiter(5);
+
+  // Intentar batch endpoint
+  try {
+    for (let i = 0; i < ids.length; i += 20) {
+      const batch = ids.slice(i, i + 20);
+      const res = await meliGet(`/items/visits/time_window?ids=${batch.join(",")}&last=${days}&unit=day`);
+      if (Array.isArray(res)) {
+        res.forEach(item => { results[item.item_id] = item.total_visits || 0; });
+      } else if (res && typeof res === "object") {
+        Object.entries(res).forEach(([id, d]) => {
+          results[id] = typeof d === "number" ? d : (d?.total_visits || 0);
+        });
+      }
+    }
+    return results;
+  } catch (e) {
+    console.error("Batch visits falló, usando individual:", e.message);
+  }
+
+  // Fallback: requests individuales con concurrencia controlada
+  await Promise.all(ids.map(id => limit(async () => {
+    try {
+      const v = await meliGet(`/items/${id}/visits?last=${days}`);
+      results[id] = v.total_visits || Object.values(v.results || {}).reduce((a, b) => a + b, 0);
+    } catch (e) {
+      results[id] = 0;
+    }
+  })));
+  return results;
+}
+
+// Ventas por item en los últimos N días, parseadas desde órdenes
+async function getSalesByItem(days = 30) {
+  const salesByItem = {};
+  try {
+    const from = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+    const to = new Date().toISOString();
+    let offset = 0;
+    while (true) {
+      const data = await meliGet(
+        `/orders/search?seller=${CONFIG.USER_ID}&order.date_created.from=${from}&order.date_created.to=${to}&limit=50&offset=${offset}`
+      );
+      const orders = data.results || [];
+      orders.forEach(order => {
+        (order.order_items || []).forEach(oi => {
+          const itemId = oi.item?.id;
+          if (itemId) salesByItem[itemId] = (salesByItem[itemId] || 0) + (oi.quantity || 1);
+        });
+      });
+      const total = data.paging?.total ?? 0;
+      offset += orders.length;
+      if (offset >= total || orders.length < 50) break;
+    }
+  } catch (e) {
+    console.error("Error obteniendo órdenes:", e.message);
+  }
+  return salesByItem;
+}
 
 // ── EMAIL ──
 function sendEmail(subject, html) {
@@ -220,6 +355,48 @@ const TOOLS = [
   { name: "ver_visitas", description: "Visitas por publicación: cuáles tienen más tráfico, total de visitas y ranking", inputSchema: { type: "object", properties: {} } },
   { name: "ver_conversion", description: "Tasa de conversión por publicación: visitas vs ventas, cuáles convierten bien y cuáles no", inputSchema: { type: "object", properties: {} } },
   { name: "enviar_resumen", description: "Envía el resumen semanal al email ahora mismo (para probar)", inputSchema: { type: "object", properties: {} } },
+  {
+    name: "noorkids_audit_quality",
+    description: "Audita la calidad de las publicaciones activas del seller en MercadoLibre. Devuelve por cada listing el quality level (health), atributos faltantes, problemas detectados y nivel de exposición.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        item_ids: { type: "array", items: { type: "string" }, description: "IDs específicos a auditar. Si se omite, audita todos los activos." }
+      }
+    }
+  },
+  {
+    name: "noorkids_get_traffic",
+    description: "Obtiene visitas y tasa de conversión de las publicaciones en los últimos N días.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        days: { type: "number", description: "Ventana temporal en días (default: 30)" },
+        item_ids: { type: "array", items: { type: "string" }, description: "Filtrar a IDs específicos. Si se omite, trae todos los activos." }
+      }
+    }
+  },
+  {
+    name: "noorkids_get_ads_performance",
+    description: "Obtiene métricas de campañas de Mercado Ads (ACOS, ROAS, costo, ventas atribuidas) por item.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        days: { type: "number", description: "Ventana temporal en días (default: 30)" },
+        item_ids: { type: "array", items: { type: "string" }, description: "Filtrar a IDs específicos." }
+      }
+    }
+  },
+  {
+    name: "noorkids_get_full_audit",
+    description: "Genera la auditoría completa de calidad + tráfico + ads de todas las publicaciones en un único objeto consolidado. Ideal como input del dashboard de auditoría SEO.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        days: { type: "number", description: "Ventana temporal en días (default: 30)" }
+      }
+    }
+  },
 ];
 
 async function executeTool(name, args) {
@@ -330,6 +507,253 @@ async function executeTool(name, args) {
   if (name === "enviar_resumen") {
     await enviarResumenSemanal();
     return `✅ Resumen enviado a ${EMAIL_TO}`;
+  }
+
+  // ── HERRAMIENTAS DE AUDITORÍA SEO ──
+
+  if (name === "noorkids_audit_quality") {
+    const start = Date.now();
+    const itemIds = args?.item_ids?.length ? args.item_ids : await getAllItemIds();
+    if (!itemIds.length) return "No hay publicaciones activas.";
+
+    console.log(`noorkids_audit_quality: procesando ${itemIds.length} publicaciones`);
+    const items = await getItemsMultiBatch(itemIds);
+
+    // Pre-cargar atributos de todas las categorías únicas (una sola vez cada una)
+    const uniqueCats = [...new Set(items.map(i => i.category_id).filter(Boolean))];
+    await Promise.all(uniqueCats.map(cat => getCatAttributes(cat)));
+
+    const healthEmoji = h => h >= 0.9 ? "🟢" : h >= 0.7 ? "🟡" : "🔴";
+    const results = [];
+    let losingExposure = 0;
+
+    for (const item of items) {
+      const health = item.health ?? 0;
+      const tags = item.tags || [];
+      const hasIncompleteSpecs = tags.includes("incomplete_technical_specs");
+      const losingExp = health < 0.8 || hasIncompleteSpecs;
+      if (losingExp) losingExposure++;
+
+      const catAttrs = await getCatAttributes(item.category_id);
+      const loadedAttrIds = new Set(
+        (item.attributes || [])
+          .filter(a => a.value_name || a.value_id)
+          .map(a => a.id)
+      );
+
+      const missingRequired = catAttrs
+        .filter(a => (a.tags || []).includes("required") && !loadedAttrIds.has(a.id))
+        .map(a => a.name);
+
+      const missingRecommended = catAttrs
+        .filter(a => !(a.tags || []).includes("required") && a.relevance === "REQUIRED" && !loadedAttrIds.has(a.id))
+        .map(a => a.name);
+
+      const picturesCount = (item.pictures || []).length;
+      const hasSizeChart = (item.attributes || []).some(a =>
+        a.id === "SIZE_GRID_ID" || a.id === "SIZE_GRID_ROW" ||
+        (a.value_name || "").toLowerCase().includes("guía de talles")
+      );
+      const catalogStatus = item.catalog_listing ? "catalog" : "non_catalog";
+
+      results.push({ item, health, losingExp, hasIncompleteSpecs, missingRequired, missingRecommended, picturesCount, hasSizeChart, catalogStatus, tags });
+    }
+
+    // Ordenar: peor quality primero
+    results.sort((a, b) => a.health - b.health);
+
+    let txt = `🔍 AUDITORÍA DE CALIDAD — NOOR KIDS\n${"═".repeat(36)}\n\n`;
+    txt += `📦 Publicaciones analizadas: ${items.length}\n`;
+    txt += `⚠️  Perdiendo exposición: ${losingExposure}/${items.length}\n`;
+    txt += `📅 ${new Date().toLocaleDateString("es-AR")}\n\n`;
+
+    for (const r of results) {
+      const { item, health, losingExp, hasIncompleteSpecs, missingRequired, missingRecommended, picturesCount, hasSizeChart, catalogStatus, tags } = r;
+      txt += `${healthEmoji(health)} ${(item.title || "—").slice(0, 52)}\n`;
+      txt += `   ID: ${item.id} | Quality: ${(health * 100).toFixed(0)}% | 📷 ${picturesCount} fotos | ${catalogStatus === "catalog" ? "📚 Catálogo" : "📝 Libre"}\n`;
+      if (losingExp) {
+        txt += `   ⚠️  PERDIENDO EXPOSICIÓN`;
+        if (hasIncompleteSpecs) txt += " — ficha técnica incompleta";
+        txt += "\n";
+      }
+      if (!hasSizeChart) txt += `   ❌ Sin guía de talles\n`;
+      if (missingRequired.length) txt += `   🔴 Requeridos faltantes: ${missingRequired.slice(0, 5).join(", ")}\n`;
+      if (missingRecommended.length) txt += `   🟡 Recomendados faltantes: ${missingRecommended.slice(0, 3).join(", ")}\n`;
+      if (!losingExp && !missingRequired.length && hasSizeChart) txt += `   ✅ Sin problemas detectados\n`;
+      txt += "\n";
+    }
+
+    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+    txt += `─── ${items.length} publicaciones procesadas en ${elapsed}s ───`;
+    return txt;
+  }
+
+  if (name === "noorkids_get_traffic") {
+    const days = Math.max(1, Math.min(args?.days || 30, 90));
+    const start = Date.now();
+    const itemIds = args?.item_ids?.length ? args.item_ids : await getAllItemIds();
+    if (!itemIds.length) return "No hay publicaciones activas.";
+
+    console.log(`noorkids_get_traffic: ${itemIds.length} publicaciones, últimos ${days} días`);
+
+    // Obtener items (títulos), visitas y ventas en paralelo
+    const [items, visitsByItem, salesByItem] = await Promise.all([
+      getItemsMultiBatch(itemIds),
+      getVisitsBatch(itemIds, days),
+      getSalesByItem(days),
+    ]);
+
+    const titleById = {};
+    items.forEach(i => { titleById[i.id] = i.title; });
+
+    const results = itemIds.map(id => {
+      const visits = visitsByItem[id] || 0;
+      const sold = salesByItem[id] || 0;
+      // CVR protegido contra división por cero
+      const cvr = visits > 0 ? (sold / visits * 100) : 0;
+      return { id, title: titleById[id] || id, visits, sold, cvr, visitsPerDay: visits / days };
+    });
+
+    results.sort((a, b) => b.visits - a.visits);
+
+    const totalVisits = results.reduce((s, r) => s + r.visits, 0);
+    const totalSales = results.reduce((s, r) => s + r.sold, 0);
+    const globalCvr = totalVisits > 0 ? (totalSales / totalVisits * 100).toFixed(1) : "0.0";
+
+    let txt = `📊 TRÁFICO Y CONVERSIÓN — ÚLTIMOS ${days} DÍAS\n${"═".repeat(38)}\n\n`;
+    txt += `👁️ Total visitas: ${totalVisits.toLocaleString("es-AR")} | 💰 Ventas: ${totalSales} | 📈 CVR global: ${globalCvr}%\n\n`;
+
+    const cvrEmoji = r => r.cvr >= 3 ? "🟢" : r.cvr >= 1 ? "🟡" : r.visits > 0 ? "🔴" : "⚫";
+
+    results.forEach(r => {
+      txt += `${cvrEmoji(r)} ${(r.title || "—").slice(0, 50)}\n`;
+      txt += `   ID: ${r.id}\n`;
+      txt += `   👁️ ${r.visits.toLocaleString()} visitas (${r.visitsPerDay.toFixed(1)}/día) | 💰 ${r.sold} ventas | 📈 CVR: ${r.cvr.toFixed(1)}%\n\n`;
+    });
+
+    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+    txt += `─── ${results.length} publicaciones procesadas en ${elapsed}s ───`;
+    return txt;
+  }
+
+  if (name === "noorkids_get_ads_performance") {
+    const days = Math.max(1, Math.min(args?.days || 30, 90));
+    const start = Date.now();
+    const ADS_HEADERS = { "api-version": "2" };
+
+    // Obtener cuenta de advertising
+    let advertiserId;
+    try {
+      const accounts = await meliGet(`/users/${CONFIG.USER_ID}/advertising_accounts`, ADS_HEADERS);
+      if (!accounts || (Array.isArray(accounts) && accounts.length === 0)) {
+        return "ℹ️ Este seller no tiene cuenta de Mercado Ads activa.";
+      }
+      const account = Array.isArray(accounts) ? accounts[0] : accounts;
+      advertiserId = account.advertiser_id || account.id;
+      if (!advertiserId) return "ℹ️ No se encontró ID de cuenta publicitaria. Verificá que Mercado Ads esté habilitado.";
+    } catch (e) {
+      return `ℹ️ No se pudo acceder a Mercado Ads: ${e.message}`;
+    }
+
+    // Obtener campañas
+    let campaigns = [];
+    try {
+      const campsRes = await meliGet(`/advertising/advertisers/${advertiserId}/product_ads/campaigns`, ADS_HEADERS);
+      campaigns = campsRes.results || (Array.isArray(campsRes) ? campsRes : []);
+    } catch (e) {
+      return `❌ Error obteniendo campañas de Mercado Ads: ${e.message}`;
+    }
+
+    if (!campaigns.length) return "ℹ️ No hay campañas de Mercado Ads configuradas.";
+
+    const dateTo = new Date().toISOString().split("T")[0];
+    const dateFrom = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString().split("T")[0];
+    const filterIds = args?.item_ids?.length ? new Set(args.item_ids) : null;
+    const byItem = {};
+
+    for (const camp of campaigns) {
+      try {
+        const metrics = await meliGet(
+          `/advertising/advertisers/${advertiserId}/product_ads/campaigns/${camp.id}/items?date_from=${dateFrom}&date_to=${dateTo}&metrics=clicks,prints,cost,direct_amount,acos,roas`,
+          ADS_HEADERS
+        );
+        const rows = metrics.results || (Array.isArray(metrics) ? metrics : []);
+        rows.forEach(m => {
+          if (!m || !m.item_id) return;
+          if (filterIds && !filterIds.has(m.item_id)) return;
+          if (!byItem[m.item_id]) {
+            byItem[m.item_id] = { item_id: m.item_id, title: m.title || m.item_id, impressions: 0, clicks: 0, cost: 0, direct_sales: 0 };
+          }
+          const e = byItem[m.item_id];
+          e.impressions += m.prints || 0;
+          e.clicks += m.clicks || 0;
+          e.cost += m.cost || 0;
+          e.direct_sales += m.direct_amount || 0;
+        });
+      } catch (e) {
+        console.error(`Error en métricas campaña ${camp.id}:`, e.message);
+      }
+    }
+
+    const results = Object.values(byItem).map(r => ({
+      ...r,
+      ctr: r.impressions > 0 ? (r.clicks / r.impressions * 100) : 0,
+      acos: r.direct_sales > 0 ? (r.cost / r.direct_sales * 100) : 0,
+      roas: r.cost > 0 ? (r.direct_sales / r.cost) : 0,
+    })).sort((a, b) => b.impressions - a.impressions);
+
+    const totalCost = results.reduce((s, r) => s + r.cost, 0);
+    const totalSales = results.reduce((s, r) => s + r.direct_sales, 0);
+    const globalRoas = totalCost > 0 ? (totalSales / totalCost).toFixed(2) : "—";
+
+    let txt = `📢 MERCADO ADS — ÚLTIMOS ${days} DÍAS\n${"═".repeat(34)}\n\n`;
+    txt += `🏷️ Campañas: ${campaigns.length} | Items anunciados: ${results.length}\n`;
+    txt += `📅 ${dateFrom} → ${dateTo}\n`;
+    txt += `💸 Gasto total: $${totalCost.toLocaleString("es-AR")} | Ventas directas: $${totalSales.toLocaleString("es-AR")} | ROAS global: ${globalRoas}x\n\n`;
+
+    if (!results.length) {
+      txt += "ℹ️ No hay datos de items anunciados para el período seleccionado.\n";
+    } else {
+      const acosEmoji = r => r.acos > 0 && r.acos <= 15 ? "🟢" : r.acos <= 30 ? "🟡" : "🔴";
+      results.forEach(r => {
+        txt += `${acosEmoji(r)} ${(r.title || r.item_id).slice(0, 50)}\n`;
+        txt += `   ID: ${r.item_id}\n`;
+        txt += `   👁️ ${r.impressions.toLocaleString()} imp | 🖱️ ${r.clicks} clicks | CTR: ${r.ctr.toFixed(2)}%\n`;
+        txt += `   💸 Gasto: $${r.cost.toLocaleString("es-AR")} | 💰 Ventas: $${r.direct_sales.toLocaleString("es-AR")}\n`;
+        txt += `   📊 ACOS: ${r.acos > 0 ? r.acos.toFixed(1) + "%" : "—"} | ROAS: ${r.roas > 0 ? r.roas.toFixed(2) + "x" : "—"}\n\n`;
+      });
+    }
+
+    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+    txt += `─── ${campaigns.length} campañas procesadas en ${elapsed}s ───`;
+    return txt;
+  }
+
+  if (name === "noorkids_get_full_audit") {
+    const days = Math.max(1, Math.min(args?.days || 30, 90));
+    const start = Date.now();
+
+    console.log(`noorkids_get_full_audit: iniciando auditoría completa (${days} días)`);
+    const allIds = await getAllItemIds();
+    if (!allIds.length) return "No hay publicaciones activas.";
+
+    // Quality y ads son independientes entre sí, tráfico también
+    const [qualityResult, trafficResult, adsResult] = await Promise.all([
+      executeTool("noorkids_audit_quality", { item_ids: allIds }),
+      executeTool("noorkids_get_traffic", { days, item_ids: allIds }),
+      executeTool("noorkids_get_ads_performance", { days }),
+    ]);
+
+    const sep = `\n${"━".repeat(42)}\n\n`;
+    const elapsed = ((Date.now() - start) / 1000).toFixed(1);
+
+    return (
+      `🎯 AUDITORÍA SEO COMPLETA — NOOR KIDS\n${"═".repeat(40)}\n` +
+      `📅 ${new Date().toLocaleDateString("es-AR")} | ⏱️ ${elapsed}s total | 📦 ${allIds.length} publicaciones\n` +
+      sep + qualityResult +
+      sep + trafficResult +
+      sep + adsResult
+    );
   }
 
   return `Herramienta desconocida: ${name}`;
