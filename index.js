@@ -277,7 +277,7 @@ async function enviarResumenSemanal() {
   console.log("Generando resumen semanal...");
   const [ord, pub, preg, me] = await Promise.all([
     meliGet(`/orders/search?seller=${CONFIG.USER_ID}&sort=date_desc&limit=50`),
-    meliGet(`/users/${CONFIG.USER_ID}/items/search?limit=50`),
+    meliGet(`/users/${CONFIG.USER_ID}/items/search?status=active&limit=50`),
     meliGet(`/questions/search?seller_id=${CONFIG.USER_ID}&limit=50`),
     meliGet(`/users/${CONFIG.USER_ID}`)
   ]);
@@ -410,7 +410,7 @@ async function executeTool(name, args) {
   }
 
   if (name === "resumen_negocio") {
-    const [ord, pub, preg, me] = await Promise.all([meliGet(`/orders/search?seller=${CONFIG.USER_ID}&sort=date_desc&limit=50`), meliGet(`/users/${CONFIG.USER_ID}/items/search?limit=50`), meliGet(`/questions/search?seller_id=${CONFIG.USER_ID}&limit=50`), meliGet(`/users/${CONFIG.USER_ID}`)]);
+    const [ord, pub, preg, me] = await Promise.all([meliGet(`/orders/search?seller=${CONFIG.USER_ID}&sort=date_desc&limit=50`), meliGet(`/users/${CONFIG.USER_ID}/items/search?status=active&limit=50`), meliGet(`/questions/search?seller_id=${CONFIG.USER_ID}&limit=50`), meliGet(`/users/${CONFIG.USER_ID}`)]);
     const orders = ord.results || [];
     const pagas = orders.filter(o => o.status === "paid");
     const ingresos = pagas.reduce((s, o) => s + (o.total_amount || 0), 0);
@@ -434,7 +434,7 @@ async function executeTool(name, args) {
   }
 
   if (name === "ver_publicaciones") {
-    const search = await meliGet(`/users/${CONFIG.USER_ID}/items/search?limit=50`);
+    const search = await meliGet(`/users/${CONFIG.USER_ID}/items/search?status=active&limit=50`);
     const ids = search.results || [];
     const items = [];
     if (ids.length) { const res = await meliGet(`/items?ids=${ids.slice(0,20).join(",")}`); (res||[]).forEach(r => r.body && items.push(r.body)); }
@@ -462,7 +462,7 @@ async function executeTool(name, args) {
   }
 
   if (name === "ver_visitas") {
-    const search = await meliGet(`/users/${CONFIG.USER_ID}/items/search?limit=50`);
+    const search = await meliGet(`/users/${CONFIG.USER_ID}/items/search?status=active&limit=50`);
     const ids = (search.results || []).slice(0, 20);
     if (!ids.length) return "No hay publicaciones.";
     const itemsRes = await meliGet(`/items?ids=${ids.join(",")}`);
@@ -480,7 +480,7 @@ async function executeTool(name, args) {
   }
 
   if (name === "ver_conversion") {
-    const search = await meliGet(`/users/${CONFIG.USER_ID}/items/search?limit=50`);
+    const search = await meliGet(`/users/${CONFIG.USER_ID}/items/search?status=active&limit=50`);
     const ids = (search.results || []).slice(0, 20);
     if (!ids.length) return "No hay publicaciones.";
     const itemsRes = await meliGet(`/items?ids=${ids.join(",")}`);
